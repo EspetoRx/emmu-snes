@@ -59,6 +59,86 @@ fn repair_overlong_lorom_title(rom: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(repaired)
 }
 
+fn repair_bsx_header(rom: &[u8]) -> Cow<'_, [u8]> {
+    let copier_header_len = match rom.len() & 0x3FF {
+        0 => 0,
+        0x200 => 0x200,
+        _ => return Cow::Borrowed(rom),
+    };
+    if copier_header_len + 0x8000 > rom.len() {
+        return Cow::Borrowed(rom);
+    }
+
+    let header_pos = copier_header_len + 0x7F00;
+    let checksum_complement =
+        u16::from_le_bytes([rom[header_pos + 0xDC], rom[header_pos + 0xDD]]);
+    let checksum = u16::from_le_bytes([rom[header_pos + 0xDE], rom[header_pos + 0xDF]]);
+    if checksum_complement != !checksum {
+        return Cow::Borrowed(rom);
+    }
+
+    // Extended header marker: 0xDA is 0x33
+    if rom[header_pos + 0xDA] != 0x33 {
+        return Cow::Borrowed(rom);
+    }
+
+    let map_mode_byte = rom[header_pos + 0xD5];
+    let is_standard_map_mode =
+        map_mode_byte & 0xE0 == 0x20 && matches!(map_mode_byte & 0x0F, 0 | 1 | 2 | 3 | 5 | 0x0A);
+    let rom_size_code = rom[header_pos + 0xD7];
+    let has_bsx_markers = rom[header_pos + 0xB0..header_pos + 0xB2] == *b"01"
+        || &rom[header_pos + 0xC0..header_pos + 0xC2] == b"BS";
+
+    if is_standard_map_mode && rom_size_code <= 0x0D {
+        return Cow::Borrowed(rom);
+    }
+
+    if !has_bsx_markers && is_standard_map_mode {
+        return Cow::Borrowed(rom);
+    }
+
+    let logical_rom_len = rom.len() - copier_header_len;
+    let computed_size_code = (logical_rom_len.next_power_of_two() / 1024)
+        .trailing_zeros()
+        .min(0x0D) as u8;
+
+    let mut repaired = rom.to_vec();
+
+    // In BS-X, the title is 16 bytes (0xFC0..0xFCF). Pad 0xFD0..0xFD5 with spaces.
+    for i in header_pos + 0xD0..header_pos + 0xD5 {
+        repaired[i] = 0x20;
+    }
+
+    // Normalize to Fast LoROM, ROM only, computed size
+    repaired[header_pos + 0xD5] = 0x20;
+    repaired[header_pos + 0xD6] = 0x00;
+    repaired[header_pos + 0xD7] = computed_size_code;
+    repaired[header_pos + 0xD8] = 0x00;
+    repaired[header_pos + 0xD9] = 0x00;
+    repaired[header_pos + 0xDA] = 0x33;
+    repaired[header_pos + 0xDB] = 0x00;
+
+    // Recalculate checksum & complement
+    let mut actual_sum = 0_u16;
+    for i in copier_header_len..repaired.len() {
+        let byte = if (header_pos + 0xDC..header_pos + 0xDE).contains(&i) {
+            0xFF
+        } else if (header_pos + 0xDE..header_pos + 0xE0).contains(&i) {
+            0x00
+        } else {
+            repaired[i]
+        };
+        actual_sum = actual_sum.wrapping_add(byte as u16);
+    }
+    let complement = !actual_sum;
+    repaired[header_pos + 0xDC] = complement as u8;
+    repaired[header_pos + 0xDD] = (complement >> 8) as u8;
+    repaired[header_pos + 0xDE] = actual_sum as u8;
+    repaired[header_pos + 0xDF] = (actual_sum >> 8) as u8;
+
+    Cow::Owned(repaired)
+}
+
 fn button_index(button: &str) -> Result<usize, String> {
     BUTTONS
         .iter()
@@ -74,6 +154,7 @@ pub struct SnesCore {
 impl SnesCore {
     pub fn new(rom: &[u8]) -> Result<Self, super_sabicom::Error> {
         let rom = repair_overlong_lorom_title(rom);
+        let rom = repair_bsx_header(rom.as_ref());
         let snes = Snes::try_from_file(rom.as_ref(), None, &Default::default())?;
         Ok(Self {
             snes,
