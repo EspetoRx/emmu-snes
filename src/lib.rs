@@ -148,7 +148,8 @@ fn button_index(button: &str) -> Result<usize, String> {
 
 pub struct SnesCore {
     snes: Snes,
-    buttons: [bool; BUTTONS.len()],
+    p1_buttons: [bool; BUTTONS.len()],
+    p2_buttons: [bool; BUTTONS.len()],
 }
 
 impl SnesCore {
@@ -158,7 +159,8 @@ impl SnesCore {
         let snes = Snes::try_from_file(rom.as_ref(), None, &Default::default())?;
         Ok(Self {
             snes,
-            buttons: [false; BUTTONS.len()],
+            p1_buttons: [false; BUTTONS.len()],
+            p2_buttons: [false; BUTTONS.len()],
         })
     }
 
@@ -171,19 +173,37 @@ impl SnesCore {
     }
 
     pub fn set_button(&mut self, button: &str, pressed: bool) -> Result<(), String> {
+        self.set_button_for_player(button, pressed, 1)
+    }
+
+    pub fn set_button_for_player(
+        &mut self,
+        button: &str,
+        pressed: bool,
+        player: u8,
+    ) -> Result<(), String> {
         let index = button_index(button)?;
-        self.buttons[index] = pressed;
+        match player {
+            1 => self.p1_buttons[index] = pressed,
+            2 => self.p2_buttons[index] = pressed,
+            _ => return Err(format!("Jogador SNES inválido: {player}")),
+        }
         Ok(())
     }
 
-    fn apply_input(&mut self) {
-        let controller = BUTTONS
+    fn build_controller_input(buttons: &[bool; BUTTONS.len()]) -> Vec<(String, bool)> {
+        BUTTONS
             .iter()
-            .zip(self.buttons)
+            .zip(*buttons)
             .map(|(name, pressed)| ((*name).to_string(), pressed))
-            .collect();
+            .collect()
+    }
+
+    fn apply_input(&mut self) {
+        let controller1 = Self::build_controller_input(&self.p1_buttons);
+        let controller2 = Self::build_controller_input(&self.p2_buttons);
         self.snes.set_input(&InputData {
-            controllers: vec![controller, Vec::new(), Vec::new(), Vec::new()],
+            controllers: vec![controller1, controller2, Vec::new(), Vec::new()],
         });
     }
 
@@ -264,6 +284,18 @@ mod wasm {
         pub fn set_button(&mut self, button: &str, pressed: bool) -> Result<(), JsValue> {
             self.core
                 .set_button(button, pressed)
+                .map_err(|error| JsValue::from_str(&error))
+        }
+
+        #[wasm_bindgen(js_name = setButtonForPlayer)]
+        pub fn set_button_for_player(
+            &mut self,
+            button: &str,
+            pressed: bool,
+            player: u8,
+        ) -> Result<(), JsValue> {
+            self.core
+                .set_button_for_player(button, pressed, player)
                 .map_err(|error| JsValue::from_str(&error))
         }
 
