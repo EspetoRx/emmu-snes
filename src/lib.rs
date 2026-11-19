@@ -9,6 +9,84 @@ const BUTTONS: [&str; 12] = [
 const FRAME_WIDTH: usize = 256;
 const FRAME_HEIGHT: usize = 224;
 
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_namespace = console)]
+    fn log(s: &str);
+}
+
+fn log_snes(msg: &str) {
+    eprintln!("{msg}");
+    #[cfg(target_arch = "wasm32")]
+    log(msg);
+}
+
+fn dump_header_window(rom: &[u8], start: usize, len: usize) -> String {
+    if start >= rom.len() {
+        return format!("0x{start:04X}: <out of bounds, len={}>", rom.len());
+    }
+    let end = (start + len).min(rom.len());
+    let hex: Vec<String> = rom[start..end].iter().map(|b| format!("{b:02X}")).collect();
+    format!("0x{start:04X}..0x{end:04X}: [{}]", hex.join(" "))
+}
+
+fn log_rom_diagnostics(stage: &str, rom: &[u8]) {
+    let copier_mod = rom.len() & 0x3FF;
+    let copier_len = if copier_mod == 0x200 { 0x200 } else { 0 };
+    let logical_len = rom.len().saturating_sub(copier_len);
+    let next_pow2 = logical_len.next_power_of_two();
+    let is_pow2 = logical_len > 0 && logical_len == next_pow2;
+
+    log_snes(&format!(
+        "[SnesCore:{stage}] len={} (0x{:X}), len&0x3FF=0x{:03X}, copier_len=0x{:X}, logical_len={} (0x{:X}), is_pow2={}, next_pow2={}",
+        rom.len(),
+        rom.len(),
+        copier_mod,
+        copier_len,
+        logical_len,
+        logical_len,
+        is_pow2,
+        next_pow2,
+    ));
+
+    for base in [0x7F00_usize, 0x7FC0_usize, 0xFF00_usize, 0xFFC0_usize] {
+        let raw_off = base;
+        let with_copier_off = base + 0x200;
+        log_snes(&format!(
+            "[SnesCore:{stage}] {} | +0x200 {}",
+            dump_header_window(rom, raw_off, 32),
+            dump_header_window(rom, with_copier_off, 32),
+        ));
+    }
+}
+
+fn pad_non_pow2_rom(rom: &[u8]) -> Cow<'_, [u8]> {
+    let copier_len = if (rom.len() & 0x3FF) == 0x200 {
+        0x200
+    } else {
+        0
+    };
+    let logical_len = rom.len().saturating_sub(copier_len);
+    let next_pow2 = logical_len.next_power_of_two();
+    if logical_len == 0 || logical_len == next_pow2 {
+        return Cow::Borrowed(rom);
+    }
+
+    let target_len = copier_len + next_pow2;
+    let mut padded = Vec::with_capacity(target_len);
+    padded.extend_from_slice(rom);
+    padded.resize(target_len, 0x00);
+    log_snes(&format!(
+        "[SnesCore:pad_non_pow2_rom] padding aplicado: {} -> {} bytes (logical {} -> {})",
+        rom.len(),
+        padded.len(),
+        logical_len,
+        next_pow2
+    ));
+    Cow::Owned(padded)
+}
+
 fn repair_overlong_lorom_title(rom: &[u8]) -> Cow<'_, [u8]> {
     let copier_header_len = match rom.len() & 0x3FF {
         0 => 0,
@@ -53,9 +131,11 @@ fn repair_overlong_lorom_title(rom: &[u8]) -> Cow<'_, [u8]> {
         return Cow::Borrowed(rom);
     }
 
-    // A few dumps let the 22nd title character overwrite the LoROM map-mode byte.
     let mut repaired = rom.to_vec();
     repaired[map_mode_index] = 0x20;
+    log_snes(&format!(
+        "[SnesCore:repair_overlong_lorom_title] reparado byte 0x{map_mode_index:X}: 0x{map_mode:02X} -> 0x20"
+    ));
     Cow::Owned(repaired)
 }
 
@@ -70,14 +150,12 @@ fn repair_bsx_header(rom: &[u8]) -> Cow<'_, [u8]> {
     }
 
     let header_pos = copier_header_len + 0x7F00;
-    let checksum_complement =
-        u16::from_le_bytes([rom[header_pos + 0xDC], rom[header_pos + 0xDD]]);
+    let checksum_complement = u16::from_le_bytes([rom[header_pos + 0xDC], rom[header_pos + 0xDD]]);
     let checksum = u16::from_le_bytes([rom[header_pos + 0xDE], rom[header_pos + 0xDF]]);
     if checksum_complement != !checksum {
         return Cow::Borrowed(rom);
     }
 
-    // Extended header marker: 0xDA is 0x33
     if rom[header_pos + 0xDA] != 0x33 {
         return Cow::Borrowed(rom);
     }
@@ -104,12 +182,10 @@ fn repair_bsx_header(rom: &[u8]) -> Cow<'_, [u8]> {
 
     let mut repaired = rom.to_vec();
 
-    // In BS-X, the title is 16 bytes (0xFC0..0xFCF). Pad 0xFD0..0xFD5 with spaces.
     for i in header_pos + 0xD0..header_pos + 0xD5 {
         repaired[i] = 0x20;
     }
 
-    // Normalize to Fast LoROM, ROM only, computed size
     repaired[header_pos + 0xD5] = 0x20;
     repaired[header_pos + 0xD6] = 0x00;
     repaired[header_pos + 0xD7] = computed_size_code;
@@ -118,7 +194,6 @@ fn repair_bsx_header(rom: &[u8]) -> Cow<'_, [u8]> {
     repaired[header_pos + 0xDA] = 0x33;
     repaired[header_pos + 0xDB] = 0x00;
 
-    // Recalculate checksum & complement
     let mut actual_sum = 0_u16;
     for i in copier_header_len..repaired.len() {
         let byte = if (header_pos + 0xDC..header_pos + 0xDE).contains(&i) {
@@ -136,6 +211,9 @@ fn repair_bsx_header(rom: &[u8]) -> Cow<'_, [u8]> {
     repaired[header_pos + 0xDE] = actual_sum as u8;
     repaired[header_pos + 0xDF] = (actual_sum >> 8) as u8;
 
+    log_snes(&format!(
+        "[SnesCore:repair_bsx_header] reparado header em 0x{header_pos:X} (size_code=0x{computed_size_code:02X}, checksum=0x{actual_sum:04X})"
+    ));
     Cow::Owned(repaired)
 }
 
@@ -154,9 +232,32 @@ pub struct SnesCore {
 
 impl SnesCore {
     pub fn new(rom: &[u8]) -> Result<Self, super_sabicom::Error> {
-        let rom = repair_overlong_lorom_title(rom);
+        log_rom_diagnostics("input", rom);
+        let rom = pad_non_pow2_rom(rom);
+        let repaired_pad = matches!(&rom, Cow::Owned(_));
+        let rom = repair_overlong_lorom_title(rom.as_ref());
+        let repaired_lorom = matches!(&rom, Cow::Owned(_));
         let rom = repair_bsx_header(rom.as_ref());
-        let snes = Snes::try_from_file(rom.as_ref(), None, &Default::default())?;
+        let repaired_bsx = matches!(&rom, Cow::Owned(_));
+
+        if repaired_pad || repaired_lorom || repaired_bsx {
+            log_rom_diagnostics("after_repairs", rom.as_ref());
+        }
+
+        log_snes("[SnesCore:new] chamando Snes::try_from_file...");
+        let snes = match Snes::try_from_file(rom.as_ref(), None, &Default::default()) {
+            Ok(instance) => {
+                log_snes("[SnesCore:new] Snes::try_from_file concluiu com sucesso.");
+                instance
+            }
+            Err(err) => {
+                log_snes(&format!(
+                    "[SnesCore:new] Snes::try_from_file retornou Err: {err}"
+                ));
+                return Err(err);
+            }
+        };
+
         Ok(Self {
             snes,
             p1_buttons: [false; BUTTONS.len()],
@@ -271,7 +372,17 @@ mod wasm {
     impl SnesEmulator {
         #[wasm_bindgen(constructor)]
         pub fn new(rom: &[u8]) -> Result<SnesEmulator, JsValue> {
-            let core = SnesCore::new(rom).map_err(|error| JsValue::from_str(&error.to_string()))?;
+            super::log_snes(&format!(
+                "[SnesEmulator::new] chamado com rom.len()={}",
+                rom.len()
+            ));
+            let core = SnesCore::new(rom).map_err(|error| {
+                let msg = error.to_string();
+                super::log_snes(&format!(
+                    "[SnesEmulator::new] erro mapeado para JsValue: {msg}"
+                ));
+                JsValue::from_str(&msg)
+            })?;
             Ok(Self { core })
         }
 

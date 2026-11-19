@@ -8,5 +8,5 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 meru-interface = "0.3"
-super-sabicom = "0.2"
+super-sabicom = { path = "./../../crates/emmu-super-sabicom" } # ajuste o caminho relativo conforme o Cargo.toml
 wasm-bindgen = "0.2"
