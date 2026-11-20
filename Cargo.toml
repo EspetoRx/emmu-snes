@@ -2,6 +2,9 @@
 name = "emmu-snes"
 version = "0.1.0"
 edition = "2024"
+description = "Emmu SNES WebAssembly core"
+repository = "https://github.com/EspetoRx/emmu-snes"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
